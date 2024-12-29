@@ -1,1 +1,1 @@
-# simple-rust-browser
+# rust-simple-browser
