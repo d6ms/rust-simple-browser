@@ -109,6 +109,40 @@ impl HtmlTokenizer {
         assert!(self.latest_token.is_none());
         t
     }
+
+    fn start_new_attribute(&mut self) {
+        assert!(self.latest_token.is_some());
+        if let Some(t) = self.latest_token.is_some() {
+            match t {
+                HtmlToken::StartTag {
+                    tag: _,
+                    self_closing: _,
+                    ref mut attributes,
+                } => {
+                    attributes.push(Attribute::new());
+                }
+                _ => panic!("`latest_token` should be StartTag"),
+            }
+        }
+    }
+
+    fn append_attribute(&mut self, c: char, is_name: bool) {
+        assert!(self.latest_token.is_some());
+        if let Some(t) = self.latest_token.as_mut() {
+            match t {
+                HtmlToken::StartTag {
+                    tag: _,
+                    self_closing: _,
+                    ref mut attributes,
+                } => {
+                    let len = attributes.len();
+                    assert!(len > 0);
+                    attributes[len - 1].add_char(c, is_name);
+                }
+                _ => panic!("`latest_token` should be StartTag"),
+            }
+        }
+    }
 }
 
 impl Iterator for HtmlTokenizer {
@@ -165,17 +199,17 @@ impl Iterator for HtmlTokenizer {
                 }
                 State::TagName => {
                     if c == ' ' {
-                        // <Tag attr <- whitespace before the attr
+                        // <tag attr <- whitespace before the attr
                         self.state = State::BeforeAttributeName;
                         continue;
                     }
                     if c == '/' {
-                        // <Tag/
+                        // <tag/
                         self.state = State::SelfClosingStartTag;
                         continue;
                     }
                     if c == '>' {
-                        // <Tag>
+                        // <tag>
                         self.state = State::Data;
                         return self.take_latest_token();
                     }
@@ -189,15 +223,130 @@ impl Iterator for HtmlTokenizer {
                     self.append_tag_name(c);
                 }
                 State::BeforeAttributeName => {
-
+                    if c == '/' || c == '>' || self.is_eof() {
+                        self.reconsume = true;
+                        self.state = State::AfterAttributeName;
+                        continue;
+                    }
+                    self.reconsume = true;
+                    self.state = State::AttributeName;
+                    self.start_new_attribute();
                 }
-                State::AttributeName => {}
-                State::AfterAttributeName => {}
-                State::BeforeAttributeValue => {}
-                State::AttributeValueDoubleQuoted => {}
-                State::AttributeValueSingleQuoted => {}
-                State::AttributeValueUnquoted => {}
-                State::AfterAttributeValueQuoted => {}
+                State::AttributeName => {
+                    if c == ' ' || c == '/' || c == '>' || self.is_eof() {
+                        // <tag disabled>
+                        self.reconsume = true;
+                        self.state = State::AfterAttributeName;
+                        continue;
+                    }
+                    if c == '=' {
+                        // <tag attr=
+                        self.state = State::BeforeAttributeValue;
+                        continue;
+                    }
+                    if c.is_ascii_uppercase() {
+                        self.append_attribute(c.to_ascii_lowercase(), true);
+                        continue;
+                    }
+                    self.append_attribute(c, true);
+                }
+                State::AfterAttributeName => {
+                    if c == ' ' {
+                        continue;
+                    }
+                    if c == '/' {
+                        // <tag disabled/
+                        self.state = State::SelfClosingStartTag;
+                        continue;
+                    }
+                    if c == '=' {
+                        self.state = State::BeforeAttributeValue;
+                        continue;
+                    }
+                    if c == '>' {
+                        // <tag attr >
+                        self.state = State::Data;
+                        return self.take_latest_token();
+                    }
+                    if self.is_eof() {
+                        return Some(HtmlToken::Eof);
+                    }
+                    // <tag attr1="value" a
+                    self.reconsume = true;
+                    self.state = State::AttributeName;
+                    self.start_new_attribute();
+                }
+                State::BeforeAttributeValue => {
+                    if c == ' ' {
+                        continue;
+                    }
+                    if c == '"' {
+                        // <tag attr="
+                        self.state = State::AttributeValueDoubleQuoted;
+                        continue;
+                    }
+                    if c == '\'' {
+                        // <tag attr='
+                        self.state = State::AttributeValueSingleQuoted;
+                        continue;
+                    }
+                    // <tag attr=a
+                    self.reconsume = true;
+                    self.state = State::AttributeValueUnquoted;
+                }
+                State::AttributeValueDoubleQuoted => {
+                    if c == '"' {
+                        self.state = State::AfterAttributeValueQuoted;
+                        continue;
+                    }
+                    if self.is_eof() {
+                        return Some(HtmlToken::Eof);
+                    }
+                    self.append_attribute(c, false);
+                }
+                State::AttributeValueSingleQuoted => {
+                    if c == '\'' {
+                        self.state = State::AfterAttributeValueQuoted;
+                        continue;
+                    }
+                    if self.is_eof() {
+                        return Some(HtmlToken::Eof);
+                    }
+                    self.append_attribute(c, false);
+                }
+                State::AttributeValueUnquoted => {
+                    if c == ' ' {
+                        self.state = State::BeforeAttributeName;
+                        continue;
+                    }
+                    if c == '>' {
+                        self.state = State::Data;
+                        return self.take_latest_token();
+                    }
+                    if self.is_eof() {
+                        return Some(HtmlToken::Eof);
+                    }
+                    self.append_attribute(c, false);
+                }
+                State::AfterAttributeValueQuoted => {
+                    if c == ' ' {
+                        self.state = State::BeforeAttributeName;
+                        continue;
+                    }
+                    if c == '/' {
+                        self.state = State::SelfClosingStartTag;
+                        continue;
+                    }
+                    if c == '>' {
+                        self.state = State::Data;
+                        return self.take_latest_token();
+                    }
+                    if self.is_eof() {
+                        return Some(HtmlToken::Eof);
+                    }
+                    self.reconsume = true;
+                    self.state = State::BeforeAttributeName;
+                }
                 State::SelfClosingStartTag => {}
                 State::ScriptData => {}
                 State::ScriptDataLessThanSign => {}
