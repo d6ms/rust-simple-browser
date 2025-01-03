@@ -102,6 +102,20 @@ impl HtmlTokenizer {
         }
     }
 
+    fn set_self_closing_flag(&mut self) {
+        assert!(self.latest_token.is_some());
+        if let Some(t) = self.latest_token.as_mut() {
+            match t {
+                HtmlToken::StartTag {
+                    tag: _,
+                    ref mut self_closing,
+                    attributes: _,
+                } => *self_closing = true,
+                _ => panic!("`latest_token` should be StartTag"),
+            }
+        }
+    }
+
     fn take_latest_token(&mut self) -> Option<HtmlToken> {
         assert!(self.latest_token.is_some());
         let t = self.latest_token.as_ref().cloned();
@@ -112,7 +126,7 @@ impl HtmlTokenizer {
 
     fn start_new_attribute(&mut self) {
         assert!(self.latest_token.is_some());
-        if let Some(t) = self.latest_token.is_some() {
+        if let Some(t) = self.latest_token.as_mut() {
             match t {
                 HtmlToken::StartTag {
                     tag: _,
@@ -347,13 +361,185 @@ impl Iterator for HtmlTokenizer {
                     self.reconsume = true;
                     self.state = State::BeforeAttributeName;
                 }
-                State::SelfClosingStartTag => {}
-                State::ScriptData => {}
-                State::ScriptDataLessThanSign => {}
-                State::ScriptDataEndTagOpen => {}
-                State::ScriptDataEndTagName => {}
-                State::TemporaryBuffer => {}
+                State::SelfClosingStartTag => {
+                    if c == '>' {
+                        self.set_self_closing_flag();
+                        self.state = State::Data;
+                        return self.take_latest_token();
+                    }
+                    if self.is_eof() {
+                        return Some(HtmlToken::Eof);
+                    }
+                }
+                State::ScriptData => {
+                    if c == '<' {
+                        self.state = State::ScriptDataLessThanSign;
+                        continue;
+                    }
+                    if self.is_eof() {
+                        return Some(HtmlToken::Eof);
+                    }
+                    return Some(HtmlToken::Char(c));
+                }
+                State::ScriptDataLessThanSign => {
+                    if c == '/' {
+                        // reset buffer on </script>
+                        self.buf = String::new();
+                        self.state = State::ScriptDataEndTagOpen;
+                        continue;
+                    }
+                    self.reconsume = true;
+                    self.state = State::ScriptData;
+                    return Some(HtmlToken::Char(c));
+                }
+                State::ScriptDataEndTagOpen => {
+                    if c.is_ascii_alphabetic() {
+                        self.reconsume = true;
+                        self.state = State::ScriptDataEndTagName;
+                        self.create_tag(false);
+                        continue;
+                    }
+                    self.reconsume = true;
+                    self.state = State::ScriptData;
+                    return Some(HtmlToken::Char('<'));
+                }
+                State::ScriptDataEndTagName => {
+                    if c == '>' {
+                        self.state = State::Data;
+                        return self.take_latest_token();
+                    }
+                    if c.is_ascii_alphabetic() {
+                        self.buf.push(c);
+                        self.append_tag_name(c.to_ascii_lowercase());
+                        continue;
+                    }
+                    self.state = State::TemporaryBuffer;
+                    self.buf = String::from("<") + &self.buf;
+                    self.buf.push(c);
+                    continue;
+                }
+                State::TemporaryBuffer => {
+                    self.reconsume = true;
+                    if self.buf.chars().count() == 0 {
+                        self.state = State::ScriptData;
+                        continue;
+                    }
+                    // remove the first char
+                    let c = self
+                        .buf
+                        .chars()
+                        .nth(0)
+                        .expect("self.buf should have at least 1 char");
+                    self.buf.remove(0);
+                    return Some(HtmlToken::Char(c));
+                }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::string::ToString;
+    use alloc::vec;
+
+    #[test]
+    fn test_empty() {
+        let html = "".to_string();
+        let mut tokenizer = HtmlTokenizer::new(html);
+        assert!(tokenizer.next().is_none());
+    }
+
+    #[test]
+    fn test_start_and_end_tag() {
+        let html = "<body></body>".to_string();
+        let mut tokenizer = HtmlTokenizer::new(html);
+        let expected = [
+            HtmlToken::StartTag {
+                tag: "body".to_string(),
+                self_closing: false,
+                attributes: Vec::new(),
+            },
+            HtmlToken::EndTag {
+                tag: "body".to_string(),
+            },
+        ];
+        for e in expected {
+            assert_eq!(Some(e), tokenizer.next());
+        }
+    }
+
+    #[test]
+    fn test_attributes() {
+        let html = "<p class=\"A\" id='B' foo=bar></p>".to_string();
+        let mut tokenizer = HtmlTokenizer::new(html);
+
+        let mut attr1 = Attribute::new();
+        for c in "class".chars() {
+            attr1.add_char(c, true);
+        }
+        attr1.add_char('A', false);
+        let mut attr2 = Attribute::new();
+        for c in "id".chars() {
+            attr2.add_char(c, true);
+        }
+        attr2.add_char('B', false);
+        let mut attr3 = Attribute::new();
+        for c in "foo".chars() {
+            attr3.add_char(c, true);
+        }
+        for c in "bar".chars() {
+            attr3.add_char(c, false);
+        }
+        let expected = [
+            HtmlToken::StartTag {
+                tag: "p".to_string(),
+                self_closing: false,
+                attributes: vec![attr1, attr2, attr3],
+            },
+            HtmlToken::EndTag {
+                tag: "p".to_string(),
+            },
+        ];
+
+        for e in expected {
+            assert_eq!(Some(e), tokenizer.next());
+        }
+    }
+
+    #[test]
+    fn test_self_closing_tag() {
+        let html = "<img />".to_string();
+        let mut tokenizer = HtmlTokenizer::new(html);
+        let expected = [HtmlToken::StartTag {
+            tag: "img".to_string(),
+            self_closing: true,
+            attributes: Vec::new(),
+        }];
+        for e in expected {
+            assert_eq!(Some(e), tokenizer.next());
+        }
+    }
+
+    #[test]
+    fn test_script_tag() {
+        let html = "<script>js code;</script>".to_string();
+        let mut tokenizer = HtmlTokenizer::new(html);
+        let mut expected = Vec::new();
+        expected.push(HtmlToken::StartTag {
+            tag: "script".to_string(),
+            self_closing: false,
+            attributes: Vec::new(),
+        });
+        for c in "js code;".chars() {
+            expected.push(HtmlToken::Char(c));
+        }
+        expected.push(HtmlToken::EndTag {
+            tag: "script".to_string(),
+        });
+        for e in expected {
+            assert_eq!(Some(e), tokenizer.next());
         }
     }
 }
